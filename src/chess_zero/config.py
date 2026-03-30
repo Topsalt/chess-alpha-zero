@@ -65,9 +65,58 @@ class ResourceConfig:
         self.log_dir = os.path.join(self.project_dir, "logs")
         self.main_log_path = os.path.join(self.log_dir, "main.log")
 
+        # ── Karyotype correction agent resources ──────────────────────────────
+        # Root directory for karyotype data (COCO-format images + annotations).
+        # Override via the KARYOTYPE_DATA_DIR environment variable.
+        self.karyotype_data_dir = os.environ.get(
+            "KARYOTYPE_DATA_DIR",
+            os.path.join(self.data_dir, "karyotype"))
+
+        # Path to the COCO annotation JSON for ground-truth labels.
+        self.karyotype_annotation_file = os.environ.get(
+            "KARYOTYPE_ANN_FILE",
+            os.path.join(self.karyotype_data_dir, "annotations", "val_500.json"))
+
+        # Trained karyotype correction model (best accepted version).
+        self.karyotype_model_dir = os.path.join(self.karyotype_data_dir, "model")
+        self.karyotype_model_config_path = os.path.join(
+            self.karyotype_model_dir, "karyotype_model_config.json")
+        self.karyotype_model_weight_path = os.path.join(
+            self.karyotype_model_dir, "karyotype_model_weight.h5")
+
+        # Next-generation candidates produced by karyotype_optimize.py.
+        self.karyotype_next_gen_dir = os.path.join(
+            self.karyotype_model_dir, "next_generation")
+
+        # Self-play data written by karyotype_self_play.py.
+        self.karyotype_play_data_dir = os.path.join(
+            self.karyotype_data_dir, "play_data")
+        self.karyotype_play_data_filename_tmpl = "karyotype_play_%s.json"
+
+        # Mask2Former mmdetection config file
+        # (default: the config committed in mask2former/).
+        self.mask2former_config_file = os.environ.get(
+            "MASK2FORMER_CONFIG",
+            os.path.join(self.project_dir,
+                         "mask2former", "cnsn_resnet50_mcls_6k.py"))
+
+        # Mask2Former checkpoint (.pth) file.
+        self.mask2former_checkpoint_file = os.environ.get(
+            "MASK2FORMER_CHECKPOINT", "")
+
+        # Directory containing the cnsn_models package required by the backbone.
+        self.cnsn_model_dir = os.environ.get(
+            "CNSN_MODEL_DIR",
+            os.path.join(self.project_dir, "mask2former"))
+
+        # Torch device for Mask2Former inference.
+        self.device = os.environ.get("DEVICE", "cpu")
+
     def create_directories(self):
         dirs = [self.project_dir, self.data_dir, self.model_dir, self.play_data_dir, self.log_dir,
-                self.next_generation_model_dir]
+                self.next_generation_model_dir,
+                self.karyotype_data_dir, self.karyotype_model_dir,
+                self.karyotype_next_gen_dir, self.karyotype_play_data_dir]
         for d in dirs:
             if not os.path.exists(d):
                 os.makedirs(d)
@@ -161,6 +210,8 @@ class Config:
             import chess_zero.configs.normal as c
         elif config_type == "distributed":
             import chess_zero.configs.distributed as c
+        elif config_type == "karyotype":
+            import chess_zero.configs.karyotype as c
         else:
             raise RuntimeError(f"unknown config_type: {config_type}")
         self.model = c.ModelConfig()
@@ -168,9 +219,10 @@ class Config:
         self.play_data = c.PlayDataConfig()
         self.trainer = c.TrainerConfig()
         self.eval = c.EvaluateConfig()
-        self.labels = Config.labels
-        self.n_labels = Config.n_labels
-        self.flipped_labels = Config.flipped_labels
+        if config_type != "karyotype":
+            self.labels = Config.labels
+            self.n_labels = Config.n_labels
+            self.flipped_labels = Config.flipped_labels
 
     @staticmethod
     def flip_policy(pol):

@@ -11,7 +11,8 @@ from .config import Config
 
 logger = getLogger(__name__)
 
-CMD_LIST = ['self', 'opt', 'eval', 'sl', 'uci']
+CMD_LIST = ['self', 'opt', 'eval', 'sl', 'uci',
+            'karyotype_self', 'karyotype_opt', 'karyotype_eval']
 
 
 def create_parser():
@@ -35,7 +36,7 @@ def setup(config: Config, args):
     :param ArgumentParser args: args to use to control config.
     """
     config.opts.new = args.new
-    if args.total_step is not None:
+    if args.total_step is not None and hasattr(config.trainer, 'start_total_steps'):
         config.trainer.start_total_steps = args.total_step
     config.resource.create_directories()
     setup_logger(config.resource.main_log_path)
@@ -53,6 +54,10 @@ def start():
 
     if args.cmd == 'uci':
         disable(999999) # plz don't interfere with uci
+
+    # Karyotype commands automatically use the karyotype config type
+    if args.cmd in ('karyotype_self', 'karyotype_opt', 'karyotype_eval'):
+        config_type = 'karyotype'
 
     config = Config(config_type=config_type)
     setup(config, args)
@@ -74,3 +79,12 @@ def start():
     elif args.cmd == 'uci':
         from .play_game import uci
         return uci.start(config)
+    elif args.cmd == 'karyotype_self':
+        from .worker import karyotype_self_play
+        return karyotype_self_play.start(config)
+    elif args.cmd == 'karyotype_opt':
+        from .worker import karyotype_optimize
+        return karyotype_optimize.start(config)
+    elif args.cmd == 'karyotype_eval':
+        from .worker import karyotype_evaluate
+        return karyotype_evaluate.start(config)
