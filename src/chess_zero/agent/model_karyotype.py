@@ -121,14 +121,32 @@ class KaryotypeModel:
         Load the model architecture from ``config_path`` (JSON) and weights
         from ``weight_path`` (HDF5).
 
-        Returns True on success, False if the files do not exist.
+        Returns True on success, False if the files do not exist or if the
+        saved model's input shape does not match the current configuration
+        (which triggers a rebuild by the caller).
         """
         from keras.models import Model
 
         if os.path.exists(config_path) and os.path.exists(weight_path):
             logger.debug(f"Loading KaryotypeModel from {config_path}")
             with open(config_path, 'rt') as f:
-                self.model = Model.from_config(json.load(f))
+                loaded_model = Model.from_config(json.load(f))
+
+            # Validate that the saved model's input shape matches the current
+            # config.  A mismatch means the files are stale (built under a
+            # different architecture) and the model must be rebuilt.
+            expected_input_shape = (None, 1, self.config.model.state_dim())
+            actual_input_shape = tuple(loaded_model.input_shape)
+            if actual_input_shape != expected_input_shape:
+                logger.warning(
+                    f"KaryotypeModel input-shape mismatch: "
+                    f"expected {expected_input_shape}, "
+                    f"saved model has {actual_input_shape}. "
+                    f"Discarding stale model and rebuilding."
+                )
+                return False
+
+            self.model = loaded_model
             self.model.load_weights(weight_path)
             self.model._make_predict_function()
             self.digest = self.fetch_digest(weight_path)
