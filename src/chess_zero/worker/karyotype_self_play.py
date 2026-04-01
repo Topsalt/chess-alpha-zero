@@ -1,16 +1,25 @@
 """
 Self-play worker for the karyotype correction agent.
 
+Pipeline
+--------
+Image → Mask2Former (segmentation + classification) → RL correction (MCTS)
+
+Mask2Former is the sole perception model: it segments each chromosome instance
+and produces the initial class predictions.  The RL correction agent
+(KaryotypeModel, an AlphaZero-style MCTS policy+value network) then iteratively
+corrects those predictions to maximise classification accuracy.
+
 Workflow
 --------
-1. Load the current best KaryotypeModel.
+1. Load the current best RL correction model (KaryotypeModel).
 2. For each episode:
-   a. Load (or generate) a ground-truth karyotype assignment.
-   b. Run Mask2FormerExtractor on the corresponding image to get embeddings
-      and the initial (possibly erroneous) class assignments.
-   c. Introduce controlled random corruptions to simulate classifier mistakes.
-   d. Let the MCTS player (KaryotypePlayer) iteratively correct the assignment.
-   e. Record (state_tensor, policy, reward) triples.
+   a. Run Mask2FormerExtractor on a karyotype image to obtain per-chromosome
+      visual embeddings and the initial class assignments (the starting state).
+   b. Let the MCTS player (KaryotypePlayer) iteratively correct the Mask2Former
+      predictions using the RL correction model.
+   c. Compute the episode reward (accuracy improvement) and record
+      (state_tensor, policy, reward) triples.
 3. Flush the buffer to disk as JSON, to be consumed by karyotype_optimize.py.
 
 Data sources
@@ -20,8 +29,8 @@ Data sources
   (compatible with the annotation format used for the Mask2Former training set).
 * If no real data is available the worker falls back to *synthetic* mode: it
   generates canonical diploid karyotypes (build_ground_truth_assignments),
-  uses zero embeddings, and only corrupts/repairs them.  This lets the agent
-  bootstrap before real Mask2Former embeddings are available.
+  uses zero embeddings, and corrupts/repairs them.  This lets the agent
+  bootstrap before real Mask2Former data is available.
 """
 
 import json
