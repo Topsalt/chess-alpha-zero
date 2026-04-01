@@ -55,9 +55,9 @@ class KaryotypeModelAPI:
         Background thread: poll all pipes, batch any available state tensors,
         run a single model.predict_on_batch() call, and send results back.
 
-        Each state tensor has shape ``(N_CHROMOSOMES, embedding_dim + N_CLASSES)``
+        Each state tensor has shape ``(STATE_DIM,)`` = ``(1198,)``
         (see KaryotypeEnv.encode_state).  The batch is stacked to
-        ``(batch, N_CHROMOSOMES, embedding_dim + N_CLASSES)`` before prediction.
+        ``(batch, STATE_DIM)`` before prediction.
         """
         while True:
             ready = connection.wait(self.pipes, timeout=0.001)

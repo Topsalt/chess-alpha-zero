@@ -86,16 +86,20 @@ class ModelConfig:
     n_chromosomes = 46
     # Number of chromosome classes (chromosomes 1–22, X, Y → 24 classes)
     n_classes = 24
-    # Dimension of the per-chromosome visual embedding extracted by Mask2Former
-    # backbone (ResNet-CNSN feature-map pooled to this size).
-    embedding_dim = 256
 
-    # ── Network architecture ──────────────────────────────────────────────────
-    # 1-D ResNet over the chromosome sequence
-    cnn_filter_num = 256
-    cnn_first_filter_size = 3
-    cnn_filter_size = 3
-    res_layer_num = 5
+    # ── Flat RL state dimension ───────────────────────────────────────────────
+    # STATE_DIM = n_chromosomes * n_classes   (predicted probs:     1104)
+    #           + n_chromosomes               (hard assignments:       46)
+    #           + n_classes                  (class counts:           24)
+    #           + n_classes                  (constraint violations:  24)
+    #           = 1198
+    @classmethod
+    def state_dim(cls):
+        return cls.n_chromosomes * cls.n_classes + cls.n_chromosomes + cls.n_classes + cls.n_classes
+
+    # ── Network architecture (MLP) ────────────────────────────────────────────
+    # Hidden layer sizes for the shared MLP backbone
+    hidden_units = [512, 256, 256]
     l2_reg = 1e-4
     value_fc_size = 256
 

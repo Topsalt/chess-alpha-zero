@@ -34,6 +34,7 @@ from chess_zero.config import Config
 from chess_zero.env.karyotype_env import (
     KaryotypeEnv,
     N_CHROMOSOMES,
+    N_CLASSES,
     build_ground_truth_assignments,
     corrupt_assignments,
 )
@@ -212,11 +213,11 @@ def _eval_episode(config: Config, cur_pipes, ng_pipes) -> tuple:
 
     # Build a shared initial state for both models — use Mask2Former when real
     # data is available; synthetic data otherwise.
-    embeddings, init_assignments, ground_truth = _load_eval_sample(config, rng)
+    probs, init_assignments, ground_truth = _load_eval_sample(config, rng)
 
     def _run(pipes) -> float:
         env = KaryotypeEnv(
-            embeddings=embeddings,
+            probs=probs,
             assignments=init_assignments.copy(),
             ground_truth=ground_truth,
             max_steps=config.eval.play_config.max_steps,
@@ -242,14 +243,14 @@ def _eval_episode(config: Config, cur_pipes, ng_pipes) -> tuple:
 
 def _load_eval_sample(config: Config, rng: np.random.Generator):
     """
-    Load (embeddings, init_assignments, ground_truth) for one evaluation episode.
+    Load (probs, init_assignments, ground_truth) for one evaluation episode.
 
     Uses Mask2Former when real data is available, giving the RL correction model
-    real visual features and Mask2Former's actual initial class assignments
+    real class probability distributions and initial class assignments
     (the same starting state as during self-play training).  Both models under
     comparison receive the same inputs for a fair evaluation.
 
-    Falls back to synthetic zero embeddings and randomly corrupted assignments
+    Falls back to synthetic probs derived from randomly corrupted assignments
     when no real karyotype images are available.
     """
     rc = config.resource
@@ -263,13 +264,12 @@ def _load_eval_sample(config: Config, rng: np.random.Generator):
             logger.warning(f"Real eval sample load failed ({exc}), using synthetic.")
 
     # Synthetic fallback
-    mc = config.model
     n_sex_x = 2 if rng.random() > 0.5 else 1
     ground_truth = build_ground_truth_assignments(n_sex_chromosomes_x=n_sex_x)
     n_errors = rng.integers(1, config.play_data.max_errors + 1)
     init_assignments = corrupt_assignments(ground_truth, n_errors, rng)
-    embeddings = np.zeros((N_CHROMOSOMES, mc.embedding_dim), dtype=np.float32)
-    return embeddings, init_assignments, ground_truth
+    probs = _make_synthetic_probs(init_assignments, rng)
+    return probs, init_assignments, ground_truth
 
 
 def _load_real_eval_sample(config: Config, rng: np.random.Generator,
@@ -277,15 +277,17 @@ def _load_real_eval_sample(config: Config, rng: np.random.Generator,
     """
     Load one real evaluation sample using Mask2Former.
 
-    Returns Mask2Former's visual embeddings and initial class predictions as
-    the starting state.  Ground truth is obtained from COCO annotations.
+    Returns Mask2Former's class probability distributions and initial class
+    predictions as the starting state.  Ground truth is obtained from COCO
+    annotations.
 
     Returns
     -------
     (np.ndarray, np.ndarray, np.ndarray)
-        embeddings of shape (N_CHROMOSOMES, embedding_dim),
+        probs of shape (N_CHROMOSOMES, N_CLASSES) — per-chromosome class
+            probability distributions from Mask2Former (frozen initial state),
         mask2former_assignments of shape (N_CHROMOSOMES,) — initial class
-            labels (1–24) predicted by Mask2Former,
+            labels (1–24), argmax of probs,
         ground_truth labels of shape (N_CHROMOSOMES,).
     """
     from chess_zero.lib.mask2former_extractor import Mask2FormerExtractor
@@ -296,7 +298,6 @@ def _load_real_eval_sample(config: Config, rng: np.random.Generator,
         checkpoint_file=rc.mask2former_checkpoint_file,
         device=getattr(rc, 'device', 'cpu'),
         cnsn_model_dir=getattr(rc, 'cnsn_model_dir', None),
-        embedding_dim=config.model.embedding_dim,
     )
 
     with open(annotation_file, 'rt') as f:
@@ -319,4 +320,19 @@ def _load_real_eval_sample(config: Config, rng: np.random.Generator,
     for i, ann in enumerate(anns[:N_CHROMOSOMES]):
         ground_truth[i] = cat_id_to_class.get(ann['category_id'], 1)
 
-    return result.embeddings, result.assignments, ground_truth
+    return result.probs, result.assignments, ground_truth
+
+
+def _make_synthetic_probs(assignments: np.ndarray,
+                           rng: np.random.Generator,
+                           confidence: float = 0.7) -> np.ndarray:
+    """
+    Build synthetic per-chromosome class probability vectors.
+
+    Mirrors the same helper in karyotype_self_play.py.
+    """
+    residual = (1.0 - confidence) / (N_CLASSES - 1)
+    probs = np.full((N_CHROMOSOMES, N_CLASSES), residual, dtype=np.float32)
+    for i, cls in enumerate(assignments):
+        probs[i, int(np.clip(cls - 1, 0, N_CLASSES - 1))] = confidence
+    return probs
