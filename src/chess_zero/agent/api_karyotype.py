@@ -57,7 +57,8 @@ class KaryotypeModelAPI:
 
         Each state tensor has shape ``(STATE_DIM,)`` = ``(1198,)``
         (see KaryotypeEnv.encode_state).  The batch is stacked to
-        ``(batch, STATE_DIM)`` before prediction.
+        ``(batch, STATE_DIM)`` and then reshaped to ``(batch, 1, STATE_DIM)``
+        to match the model's ``Input(shape=(1, STATE_DIM))`` layer.
         """
         while True:
             ready = connection.wait(self.pipes, timeout=0.001)
@@ -70,8 +71,13 @@ class KaryotypeModelAPI:
                     data.append(pipe.recv())
                     result_pipes.append(pipe)
 
-            # data[i] shape: (N_CHROMOSOMES, input_dim)
-            batch = np.asarray(data, dtype=np.float32)  # (B, N, D)
+            # data[i] shape: (STATE_DIM,) = (1198,); add a leading dim so the
+            # batch becomes (B, 1, STATE_DIM) as expected by the model's
+            # Input(shape=(1, STATE_DIM)) layer.
+            batch = np.asarray(data, dtype=np.float32)  # (B, STATE_DIM)
+            assert batch.ndim == 2, \
+                f"Expected 2-D batch from pipe, got shape {batch.shape}"
+            batch = batch[:, np.newaxis, :]              # (B, 1, STATE_DIM)
             policy_batch, value_batch = self.agent_model.model.predict_on_batch(batch)
 
             for pipe, policy, value in zip(result_pipes, policy_batch, value_batch):

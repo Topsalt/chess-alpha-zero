@@ -4,8 +4,8 @@ Dual-head policy + value neural network for the karyotype correction agent.
 Architecture:
 
 Input
-    Flat vector of shape (STATE_DIM,) = (1198,).
-    Components:
+    Tensor of shape (1, STATE_DIM) = (1, 1198).
+    Components (flattened in the trailing STATE_DIM dimension):
       · Predicted class probabilities (frozen, from Mask2Former):
           46 chromosomes × 24 classes = 1104 floats
       · Normalised hard assignments: 46 floats
@@ -77,7 +77,7 @@ class KaryotypeModel:
         state_dim = mc.state_dim()     # 1198
         n_actions = mc.n_actions()     # 1105
 
-        in_x = x = Input(shape=(state_dim,), name='karyotype_input')
+        in_x = x = Input(shape=(1, state_dim), name='karyotype_input')
 
         # ── Shared MLP backbone ───────────────────────────────────────────────
         for i, units in enumerate(mc.hidden_units):

@@ -152,6 +152,14 @@ class KaryotypeOptimizeWorker:
         states = np.asarray(list(self.dataset[0]), dtype=np.float32)
         policies = np.asarray(list(self.dataset[1]), dtype=np.float32)
         values = np.asarray(list(self.dataset[2]), dtype=np.float32)
+        # Model expects input shape (batch, 1, STATE_DIM); add the middle dim.
+        if states.ndim == 2:
+            states = states[:, np.newaxis, :]
+        elif states.ndim != 3:
+            raise ValueError(
+                f"Unexpected states array shape {states.shape}; "
+                "expected 2-D (N, STATE_DIM) from the data pipeline."
+            )
         return states, policies, values
 
     # ── Model I/O ─────────────────────────────────────────────────────────────
