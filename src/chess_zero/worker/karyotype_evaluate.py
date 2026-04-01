@@ -1,14 +1,24 @@
 """
 Evaluation worker for the karyotype correction agent.
 
-Compares a newly-trained KaryotypeModel (next-generation) against the current
-best model by running them both on a held-out set of corrupted karyotype
-episodes.  Accepts the new model as "best" only if its average corrected
-accuracy exceeds the current best by at least ``config.eval.accuracy_threshold``.
+Pipeline
+--------
+Image → Mask2Former (segmentation + classification) → RL correction (MCTS)
+
+Compares a newly-trained RL correction model (KaryotypeModel, next-generation)
+against the current best model by running them both on the same held-out
+karyotype episodes.  For a fair comparison both models receive identical inputs:
+the same Mask2Former visual embeddings and the same initial class assignments.
+Accepts the new model as "best" only if its average corrected accuracy exceeds
+the current best by at least ``config.eval.accuracy_threshold``.
+
+Falls back to synthetic zero-embedding data when no real karyotype images are
+available, preserving the ability to evaluate before Mask2Former data is set up.
 
 Mirrors the design of worker/evaluate.py.
 """
 
+import json
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from glob import glob
@@ -24,6 +34,7 @@ from chess_zero.config import Config
 from chess_zero.env.karyotype_env import (
     KaryotypeEnv,
     N_CHROMOSOMES,
+    N_CLASSES,
     build_ground_truth_assignments,
     corrupt_assignments,
 )
@@ -189,8 +200,9 @@ def _eval_episode(config: Config, cur_pipes, ng_pipes) -> tuple:
     Run one evaluation episode with both the current and next-gen model and
     return their final classification accuracies.
 
-    Both models start from the *same* corrupted karyotype so the comparison
-    is fair.
+    Both models start from the *same* initial state (produced by Mask2Former
+    when real data is available, or synthetic data as a fallback) so the
+    comparison is fair.
 
     Returns
     -------
@@ -198,19 +210,14 @@ def _eval_episode(config: Config, cur_pipes, ng_pipes) -> tuple:
         (current_model_accuracy, next_gen_model_accuracy)
     """
     rng = np.random.default_rng()
-    mc = config.model
 
-    # Build a shared corrupted karyotype
-    n_sex_x = 2 if rng.random() > 0.5 else 1
-    ground_truth = build_ground_truth_assignments(n_sex_chromosomes_x=n_sex_x)
-    n_errors = rng.integers(1, config.play_data.max_errors + 1)
-    init_assignments = corrupt_assignments(ground_truth, int(n_errors), rng)
-    # Use zero embeddings (evaluation only needs fair comparison, not realism)
-    embeddings = np.zeros((N_CHROMOSOMES, mc.embedding_dim), dtype=np.float32)
+    # Build a shared initial state for both models — use Mask2Former when real
+    # data is available; synthetic data otherwise.
+    probs, init_assignments, ground_truth = _load_eval_sample(config, rng)
 
     def _run(pipes) -> float:
         env = KaryotypeEnv(
-            embeddings=embeddings,
+            probs=probs,
             assignments=init_assignments.copy(),
             ground_truth=ground_truth,
             max_steps=config.eval.play_config.max_steps,
@@ -232,3 +239,100 @@ def _eval_episode(config: Config, cur_pipes, ng_pipes) -> tuple:
         ng_pipes.append(ng_p)
 
     return cur_acc, ng_acc
+
+
+def _load_eval_sample(config: Config, rng: np.random.Generator):
+    """
+    Load (probs, init_assignments, ground_truth) for one evaluation episode.
+
+    Uses Mask2Former when real data is available, giving the RL correction model
+    real class probability distributions and initial class assignments
+    (the same starting state as during self-play training).  Both models under
+    comparison receive the same inputs for a fair evaluation.
+
+    Falls back to synthetic probs derived from randomly corrupted assignments
+    when no real karyotype images are available.
+    """
+    rc = config.resource
+    data_dir = getattr(rc, 'karyotype_data_dir', None)
+    annotation_file = getattr(rc, 'karyotype_annotation_file', None)
+
+    if data_dir and annotation_file and os.path.isfile(annotation_file):
+        try:
+            return _load_real_eval_sample(config, rng, data_dir, annotation_file)
+        except Exception as exc:
+            logger.warning(f"Real eval sample load failed ({exc}), using synthetic.")
+
+    # Synthetic fallback
+    n_sex_x = 2 if rng.random() > 0.5 else 1
+    ground_truth = build_ground_truth_assignments(n_sex_chromosomes_x=n_sex_x)
+    n_errors = rng.integers(1, config.play_data.max_errors + 1)
+    init_assignments = corrupt_assignments(ground_truth, n_errors, rng)
+    probs = _make_synthetic_probs(init_assignments, rng)
+    return probs, init_assignments, ground_truth
+
+
+def _load_real_eval_sample(config: Config, rng: np.random.Generator,
+                            data_dir: str, annotation_file: str):
+    """
+    Load one real evaluation sample using Mask2Former.
+
+    Returns Mask2Former's class probability distributions and initial class
+    predictions as the starting state.  Ground truth is obtained from COCO
+    annotations.
+
+    Returns
+    -------
+    (np.ndarray, np.ndarray, np.ndarray)
+        probs of shape (N_CHROMOSOMES, N_CLASSES) — per-chromosome class
+            probability distributions from Mask2Former (frozen initial state),
+        mask2former_assignments of shape (N_CHROMOSOMES,) — initial class
+            labels (1–24), argmax of probs,
+        ground_truth labels of shape (N_CHROMOSOMES,).
+    """
+    from chess_zero.lib.mask2former_extractor import Mask2FormerExtractor
+
+    rc = config.resource
+    extractor = Mask2FormerExtractor(
+        config_file=rc.mask2former_config_file,
+        checkpoint_file=rc.mask2former_checkpoint_file,
+        device=getattr(rc, 'device', 'cpu'),
+        cnsn_model_dir=getattr(rc, 'cnsn_model_dir', None),
+    )
+
+    with open(annotation_file, 'rt') as f:
+        coco_ann = json.load(f)
+
+    images = coco_ann['images']
+    img_meta = images[int(rng.integers(len(images)))]
+    image_path = os.path.join(data_dir, img_meta['file_name'])
+
+    result = extractor.extract(image_path)
+
+    img_id = img_meta['id']
+    cat_id_to_class = {
+        cat['id']: int(cat['name'].split('_')[1])
+        for cat in coco_ann['categories']
+    }
+    anns = [a for a in coco_ann['annotations'] if a['image_id'] == img_id]
+
+    ground_truth = np.ones(N_CHROMOSOMES, dtype=np.int32)
+    for i, ann in enumerate(anns[:N_CHROMOSOMES]):
+        ground_truth[i] = cat_id_to_class.get(ann['category_id'], 1)
+
+    return result.probs, result.assignments, ground_truth
+
+
+def _make_synthetic_probs(assignments: np.ndarray,
+                           rng: np.random.Generator,
+                           confidence: float = 0.7) -> np.ndarray:
+    """
+    Build synthetic per-chromosome class probability vectors.
+
+    Mirrors the same helper in karyotype_self_play.py.
+    """
+    residual = (1.0 - confidence) / (N_CLASSES - 1)
+    probs = np.full((N_CHROMOSOMES, N_CLASSES), residual, dtype=np.float32)
+    for i, cls in enumerate(assignments):
+        probs[i, int(np.clip(cls - 1, 0, N_CLASSES - 1))] = confidence
+    return probs

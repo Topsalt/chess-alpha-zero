@@ -24,8 +24,9 @@ Usage
     )
 
     result = extractor.extract('path/to/karyotype_image.png')
+    # result.probs       → np.ndarray (N_CHROMOSOMES, N_CLASSES) class probabilities
+    # result.assignments → np.ndarray (N_CHROMOSOMES,) int labels 1-24 (argmax of probs)
     # result.embeddings  → np.ndarray (N_CHROMOSOMES, embedding_dim)
-    # result.assignments → np.ndarray (N_CHROMOSOMES,) int labels 1-24
     # result.masks       → list of np.ndarray binary masks
     # result.scores      → np.ndarray (N_CHROMOSOMES,) confidence scores
 
@@ -70,6 +71,12 @@ class ExtractionResult:
     # Shape: (N_CHROMOSOMES,) — integer class labels in 1..N_CLASSES
     assignments: np.ndarray = field(default_factory=lambda: np.ones(
         N_CHROMOSOMES, dtype=np.int32))
+
+    # Shape: (N_CHROMOSOMES, N_CLASSES) — per-chromosome class probability
+    # distributions from Mask2Former's classification head.  These are the
+    # frozen initial predictions used as the first component of the RL state.
+    probs: np.ndarray = field(default_factory=lambda: np.zeros(
+        (N_CHROMOSOMES, N_CLASSES), dtype=np.float32))
 
     # Binary segmentation masks, one per chromosome (may differ in H×W)
     masks: List[np.ndarray] = field(default_factory=list)
@@ -146,26 +153,38 @@ class Mask2FormerExtractor:
 
     def _register_embedding_hook(self):
         """
-        Register a forward hook on the Mask2Former pixel-decoder to capture
-        the per-instance feature embeddings.
+        Register forward hooks on the Mask2Former model to capture:
+          1. Per-query transformer-decoder features (for visual embeddings).
+          2. Per-query classification logits (for class probability distributions).
 
-        The pixel-decoder produces multi-scale feature maps; we use the
-        finest scale (index 0 of ``outs``) and RoI-pool/mask-pool per instance.
+        Both hooks store their outputs in self._hook_outputs to be consumed
+        after each forward pass.
         """
-        # The hook captures the output of the panoptic_head's transformer-decoder.
-        # We store it in self._hook_outputs to be consumed after each forward pass.
-        def _hook(module, input_, output):
-            # output is a tuple; the last element is the per-query features
-            # shape: (batch, num_queries, embed_dims) = (1, 100, 256)
+        # Hook 1: transformer-decoder query features → visual embeddings
+        def _embedding_hook(module, input_, output):
             self._hook_outputs['query_features'] = output
 
         try:
             decoder = self._model.panoptic_head.transformer_decoder
-            decoder.register_forward_hook(_hook)
+            decoder.register_forward_hook(_embedding_hook)
         except AttributeError:
             logger.warning(
                 "Could not register embedding hook on transformer_decoder. "
                 "Embeddings will be zeros. Check the Mask2Former architecture.")
+
+        # Hook 2: classification head → per-query class logits
+        def _cls_hook(module, input_, output):
+            # output shape: (batch, num_queries, n_classes) or (batch*num_queries, n_classes)
+            self._hook_outputs['cls_logits'] = output
+
+        try:
+            cls_embed = self._model.panoptic_head.cls_embed
+            cls_embed.register_forward_hook(_cls_hook)
+        except AttributeError:
+            logger.warning(
+                "Could not register cls_embed hook on panoptic_head. "
+                "Class probabilities will be derived from scores. "
+                "Check the Mask2Former architecture.")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -229,6 +248,11 @@ class Mask2FormerExtractor:
         raw_embeddings = self._extract_embeddings_from_queries(
             query_features, raw_labels)
 
+        # Retrieve per-query class probabilities captured by the cls hook
+        cls_logits = self._hook_outputs.get('cls_logits', None)
+        raw_probs = self._extract_probs_from_cls_logits(
+            cls_logits, raw_labels, raw_scores)
+
         # Keep only top-N_CHROMOSOMES by score if over-detected
         if n_detected > N_CHROMOSOMES:
             top_idx = np.argsort(raw_scores)[::-1][:N_CHROMOSOMES]
@@ -236,11 +260,13 @@ class Mask2FormerExtractor:
             raw_scores = raw_scores[top_idx]
             raw_masks = raw_masks[top_idx]
             raw_embeddings = raw_embeddings[top_idx]
+            raw_probs = raw_probs[top_idx]
 
         # Pad with zeros / label=1 if under-detected
         n_used = len(raw_labels)
         embeddings = np.zeros((N_CHROMOSOMES, self.embedding_dim), dtype=np.float32)
         assignments = np.ones(N_CHROMOSOMES, dtype=np.int32)  # default class 1
+        probs = np.zeros((N_CHROMOSOMES, N_CLASSES), dtype=np.float32)
         scores = np.zeros(N_CHROMOSOMES, dtype=np.float32)
         masks = []
 
@@ -248,16 +274,22 @@ class Mask2FormerExtractor:
             embeddings[i] = raw_embeddings[i]
             # Convert 0-based label to 1-based class (clamp to valid range)
             assignments[i] = int(np.clip(raw_labels[i] + 1, 1, N_CLASSES))
+            probs[i] = raw_probs[i]
             scores[i] = raw_scores[i]
             masks.append(raw_masks[i])
 
-        # Pad mask list with empty masks for missing detections
-        for _ in range(N_CHROMOSOMES - n_used):
+        # For padded (undetected) chromosomes: assign high probability to class 1
+        # (consistent with the default assignment=1 used for missing detections)
+        for i in range(n_used, N_CHROMOSOMES):
+            probs[i, 0] = 0.7  # class 1 (0-indexed) as safe default
+            residual = 0.3 / (N_CLASSES - 1) if N_CLASSES > 1 else 0.0
+            probs[i, 1:] = residual
             masks.append(np.zeros((1, 1), dtype=bool))
 
         return ExtractionResult(
             embeddings=embeddings,
             assignments=assignments,
+            probs=probs,
             masks=masks,
             scores=scores,
             image_path=image_path,
@@ -330,6 +362,83 @@ class Mask2FormerExtractor:
             logger.warning(f"Could not extract embeddings from query features: {exc}")
             return np.zeros((n_detected, self.embedding_dim), dtype=np.float32)
 
+    def _extract_probs_from_cls_logits(self, cls_logits,
+                                        raw_labels: np.ndarray,
+                                        raw_scores: np.ndarray) -> np.ndarray:
+        """
+        Extract per-instance class probability distributions.
+
+        Tries to use the raw classification logits captured by the cls_embed hook.
+        Falls back to constructing a soft probability vector from (label, score)
+        when the hook is not available.
+
+        Parameters
+        ----------
+        cls_logits : torch.Tensor or None
+            Shape: (batch=1, num_queries, n_classes+1) — raw logits from
+            Mask2Former's classification head (includes background class).
+            May be None if the hook was not registered.
+        raw_labels : np.ndarray
+            0-based detected class indices, length = n_detected.
+        raw_scores : np.ndarray
+            Confidence scores (max softmax probability), length = n_detected.
+
+        Returns
+        -------
+        np.ndarray, shape (n_detected, N_CLASSES)
+            Per-instance probability distribution over N_CLASSES (no background).
+        """
+        n_detected = len(raw_labels)
+        if n_detected == 0:
+            return np.zeros((0, N_CLASSES), dtype=np.float32)
+
+        if cls_logits is not None:
+            try:
+                import torch
+                if isinstance(cls_logits, (tuple, list)):
+                    logits = cls_logits[-1]
+                else:
+                    logits = cls_logits
+
+                # Shape: (batch, num_queries, n_cls+1) or (num_queries, n_cls+1)
+                if logits.dim() == 3:
+                    logits = logits[0]  # remove batch dim
+
+                # Keep only the first n_detected queries; discard background class
+                # Mask2Former typically appends a background class at the end.
+                n_q = logits.shape[0]
+                n_det = min(n_detected, n_q)
+                logits_np = logits[:n_det].detach().cpu().numpy().astype(np.float32)
+
+                # Remove background class if present (last column)
+                if logits_np.shape[1] > N_CLASSES:
+                    logits_np = logits_np[:, :N_CLASSES]
+                elif logits_np.shape[1] < N_CLASSES:
+                    # Pad missing columns with -inf equivalent
+                    pad = np.full(
+                        (logits_np.shape[0], N_CLASSES - logits_np.shape[1]),
+                        fill_value=-1e9, dtype=np.float32)
+                    logits_np = np.hstack([logits_np, pad])
+
+                # Softmax to convert logits → probabilities
+                exp_l = np.exp(logits_np - logits_np.max(axis=1, keepdims=True))
+                probs = exp_l / exp_l.sum(axis=1, keepdims=True)
+
+                # Pad any remaining detections with the fallback
+                if n_det < n_detected:
+                    fallback = _scores_to_probs(
+                        raw_labels[n_det:], raw_scores[n_det:])
+                    probs = np.vstack([probs, fallback])
+
+                return probs.astype(np.float32)
+            except Exception as exc:
+                logger.warning(
+                    f"Could not extract class probs from cls_logits: {exc}. "
+                    "Falling back to score-based probabilities.")
+
+        # Fallback: build soft probability vectors from (label, score)
+        return _scores_to_probs(raw_labels, raw_scores)
+
     @staticmethod
     def _parse_legacy_result(mmdet_result):
         """Parse the old-style (list of arrays) MMDetection result."""
@@ -347,3 +456,38 @@ class Mask2FormerExtractor:
         return (np.array(labels, dtype=np.int32),
                 np.array(scores, dtype=np.float32),
                 np.array(masks) if masks else np.zeros((0, 1, 1), dtype=bool))
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _scores_to_probs(labels: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    """
+    Build a soft per-class probability matrix from argmax labels and confidence
+    scores.
+
+    For each instance with predicted class ``c`` and confidence ``s``:
+      - prob[c] = s   (the confidence becomes the probability of the top class)
+      - prob[j] = (1 - s) / (N_CLASSES - 1)   for all j ≠ c
+
+    This provides a reasonable stand-in when full per-class logits are not
+    available from the Mask2Former hook.
+
+    Parameters
+    ----------
+    labels : np.ndarray, shape (n,)  — 0-based class indices
+    scores : np.ndarray, shape (n,)  — confidence in [0, 1]
+
+    Returns
+    -------
+    np.ndarray, shape (n, N_CLASSES)
+    """
+    n = len(labels)
+    probs = np.empty((n, N_CLASSES), dtype=np.float32)
+    residual_denom = max(N_CLASSES - 1, 1)
+    for i in range(n):
+        s = float(np.clip(scores[i], 0.0, 1.0))
+        residual = (1.0 - s) / residual_denom
+        probs[i] = residual
+        c = int(np.clip(labels[i], 0, N_CLASSES - 1))
+        probs[i, c] = s
+    return probs

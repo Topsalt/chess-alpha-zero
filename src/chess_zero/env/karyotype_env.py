@@ -2,8 +2,25 @@
 Karyotype correction environment for the AlphaZero-style RL agent.
 
 Replaces chess_env.py: the "board" is a karyotype state consisting of
-  - per-chromosome visual embeddings (from Mask2Former / ResNet-CNSN backbone)
+  - per-chromosome class probability distributions (from Mask2Former, frozen)
   - current class assignment for each chromosome (1–24)
+
+The RL state is a flat vector of dimension STATE_DIM = 1198:
+
+  (1) Predicted probabilities (frozen, from Mask2Former):
+        46 chromosomes × 24 classes = 1104 floats
+  (2) Current hard assignments, normalised:
+        46 floats (each assignment / N_CLASSES, range [1/24, 1])
+  (3) Current class counts, normalised:
+        24 floats (count_per_class / N_CHROMOSOMES)
+  (4) Binary constraint violation indicators:
+        24 floats (1 if class count violates diploid rules, else 0)
+
+  Total: 1104 + 46 + 24 + 24 = 1198
+
+The predicted probabilities are the direct output of Mask2Former and are
+*never updated* during an episode — they represent the classifier's initial
+confidence.  Components (2)–(4) are updated after each correction action.
 
 Actions are (chromosome_index, target_class) reassignment operations, plus
 a special STOP action that ends the episode.
@@ -31,6 +48,10 @@ Y_CLASS = 24                # class index for Y chromosome
 #   index = N_CHROMOSOMES * N_CLASSES                 for STOP
 N_ACTIONS = N_CHROMOSOMES * N_CLASSES + 1
 STOP_ACTION = N_ACTIONS - 1  # == 1104
+
+# Flat RL state dimension:
+#   probs (1104) + hard assignments (46) + class counts (24) + violations (24)
+STATE_DIM = N_CHROMOSOMES * N_CLASSES + N_CHROMOSOMES + N_CLASSES + N_CLASSES  # 1198
 
 
 # ── Helper functions ─────────────────────────────────────────────────────────
@@ -60,10 +81,11 @@ class KaryotypeEnv:
     Models the chromosome karyotype correction problem as an RL environment.
 
     Attributes:
-        embeddings (np.ndarray): shape (N_CHROMOSOMES, embedding_dim) – visual
-            features of each chromosome extracted by Mask2Former backbone.
+        probs (np.ndarray): shape (N_CHROMOSOMES, N_CLASSES) – per-class
+            probability distributions output by Mask2Former for each
+            chromosome.  These are *frozen* for the entire episode.
         assignments (np.ndarray): shape (N_CHROMOSOMES,) – current class label
-            (1–24) assigned to each chromosome.
+            (1–24) assigned to each chromosome.  Updated by each action.
         ground_truth (np.ndarray | None): shape (N_CHROMOSOMES,) – correct class
             labels.  None during inference.
         step_count (int): number of correction actions taken so far.
@@ -71,13 +93,14 @@ class KaryotypeEnv:
         max_steps (int): episode length limit.
     """
 
-    def __init__(self, embeddings: np.ndarray, assignments: np.ndarray,
+    def __init__(self, probs: np.ndarray, assignments: np.ndarray,
                  ground_truth=None, max_steps: int = 20):
         """
         Parameters
         ----------
-        embeddings : np.ndarray, shape (N_CHROMOSOMES, embedding_dim)
-            Per-chromosome visual features.
+        probs : np.ndarray, shape (N_CHROMOSOMES, N_CLASSES)
+            Per-chromosome class probability distributions from Mask2Former
+            (or synthetic equivalents).  These are frozen for the episode.
         assignments : np.ndarray, shape (N_CHROMOSOMES,)
             Initial class labels (integers in 1–24) produced by the initial
             classifier (Mask2Former).
@@ -86,7 +109,8 @@ class KaryotypeEnv:
         max_steps : int
             Maximum correction steps before the episode is forced to end.
         """
-        self.embeddings = np.asarray(embeddings, dtype=np.float32)
+        self.probs = np.asarray(probs, dtype=np.float32)
+        self.probs.flags.writeable = False  # frozen for entire episode
         self.assignments = np.asarray(assignments, dtype=np.int32)
         self.ground_truth = (np.asarray(ground_truth, dtype=np.int32)
                              if ground_truth is not None else None)
@@ -94,8 +118,8 @@ class KaryotypeEnv:
         self.step_count = 0
         self.stopped = False
 
-        assert self.embeddings.ndim == 2
-        assert self.embeddings.shape[0] == N_CHROMOSOMES
+        assert self.probs.shape == (N_CHROMOSOMES, N_CLASSES), \
+            f"probs must have shape ({N_CHROMOSOMES}, {N_CLASSES}), got {self.probs.shape}"
         assert self.assignments.shape == (N_CHROMOSOMES,)
         assert np.all((self.assignments >= 1) & (self.assignments <= N_CLASSES)), \
             "All assignments must be in 1..N_CLASSES"
@@ -190,28 +214,69 @@ class KaryotypeEnv:
 
     def encode_state(self) -> np.ndarray:
         """
-        Encode the current state into a tensor suitable for the neural network.
+        Encode the current karyotype state into a flat vector for the neural
+        network.
 
         Returns
         -------
-        np.ndarray, shape (N_CHROMOSOMES, embedding_dim + N_CLASSES)
-            Each row is the concatenation of:
-              - the chromosome's visual embedding (embedding_dim floats)
-              - a one-hot vector of its current class assignment (N_CLASSES floats)
-        """
-        embedding_dim = self.embeddings.shape[1]
-        one_hot = np.zeros((N_CHROMOSOMES, N_CLASSES), dtype=np.float32)
-        for i, cls in enumerate(self.assignments):
-            one_hot[i, cls - 1] = 1.0  # cls is 1-indexed
+        np.ndarray, shape (STATE_DIM,) = (1198,)
+            Concatenation of four components:
 
-        state = np.concatenate([self.embeddings, one_hot], axis=1)  # (N, D+24)
-        assert state.shape == (N_CHROMOSOMES, embedding_dim + N_CLASSES)
+            (1) Predicted probabilities (frozen, from Mask2Former):
+                  self.probs.flatten() — 46 × 24 = 1104 floats.
+                  Never updated during the episode.
+
+            (2) Normalised hard assignments:
+                  self.assignments / N_CLASSES — 46 floats in [1/24, 1].
+                  Updated after each correction action.
+
+            (3) Normalised class counts:
+                  count[c] / N_CHROMOSOMES for c in 1..N_CLASSES — 24 floats.
+                  count[c] = number of chromosomes currently assigned to class c.
+
+            (4) Binary constraint violation indicators:
+                  1.0 if the current count for class c violates diploid rules,
+                  else 0.0 — 24 floats.
+                  Rules (diploid defaults):
+                    · Autosomes (1–22): violation iff count ≠ 2
+                    · X (class 23):    violation iff count > 2
+                    · Y (class 24):    violation iff count > 1
+        """
+        # (1) Frozen predicted probabilities → shape (1104,)
+        probs_flat = self.probs.flatten()
+
+        # (2) Normalised current assignments → shape (46,)
+        assignments_norm = self.assignments.astype(np.float32) / N_CLASSES
+
+        # Compute per-class chromosome counts (used for components 3 and 4)
+        counts = np.zeros(N_CLASSES, dtype=np.float32)
+        for cls in self.assignments:
+            counts[cls - 1] += 1.0  # cls is 1-indexed
+
+        # (3) Normalised class counts → shape (24,)
+        counts_norm = counts / N_CHROMOSOMES
+
+        # (4) Binary constraint violation indicators → shape (24,)
+        violations = np.zeros(N_CLASSES, dtype=np.float32)
+        for c in range(1, N_CLASSES + 1):
+            cnt = counts[c - 1]
+            if 1 <= c <= N_AUTOSOME_CLASSES:
+                violations[c - 1] = 1.0 if cnt != 2.0 else 0.0
+            elif c == X_CLASS:
+                violations[c - 1] = 1.0 if cnt > 2.0 else 0.0
+            else:  # Y_CLASS
+                violations[c - 1] = 1.0 if cnt > 1.0 else 0.0
+
+        state = np.concatenate([probs_flat, assignments_norm,
+                                 counts_norm, violations])
+        assert state.shape == (STATE_DIM,), \
+            f"encode_state: expected shape ({STATE_DIM},), got {state.shape}"
         return state
 
     def copy(self) -> 'KaryotypeEnv':
         """Return a deep copy of this environment for MCTS tree search."""
         env = KaryotypeEnv.__new__(KaryotypeEnv)
-        env.embeddings = self.embeddings  # read-only; share reference
+        env.probs = self.probs        # frozen (write-protected); safe to share reference
         env.assignments = self.assignments.copy()
         env.ground_truth = self.ground_truth  # read-only; share reference
         env.max_steps = self.max_steps

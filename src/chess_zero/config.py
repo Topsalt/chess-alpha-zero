@@ -77,22 +77,12 @@ class ResourceConfig:
             "KARYOTYPE_ANN_FILE",
             os.path.join(self.karyotype_data_dir, "annotations", "val_500.json"))
 
-        # Trained karyotype correction model (best accepted version).
-        self.karyotype_model_dir = os.path.join(self.karyotype_data_dir, "model")
-        self.karyotype_model_config_path = os.path.join(
-            self.karyotype_model_dir, "karyotype_model_config.json")
-        self.karyotype_model_weight_path = os.path.join(
-            self.karyotype_model_dir, "karyotype_model_weight.h5")
-
-        # Next-generation candidates produced by karyotype_optimize.py.
-        self.karyotype_next_gen_dir = os.path.join(
-            self.karyotype_model_dir, "next_generation")
-
-        # Self-play data written by karyotype_self_play.py.
-        self.karyotype_play_data_dir = os.path.join(
-            self.karyotype_data_dir, "play_data")
-        self.karyotype_play_data_filename_tmpl = "karyotype_play_%s.json"
-
+        # ── Mask2Former — the sole perception model ────────────────────────────
+        # Mask2Former handles BOTH instance segmentation and initial chromosome
+        # classification.  Its outputs (per-chromosome visual embeddings + initial
+        # class predictions) are the direct input to the RL correction agent.
+        # No separate chromosome classification model is needed.
+        #
         # Mask2Former mmdetection config file
         # (default: the config committed in mask2former/).
         self.mask2former_config_file = os.environ.get(
@@ -108,6 +98,27 @@ class ResourceConfig:
         self.cnsn_model_dir = os.environ.get(
             "CNSN_MODEL_DIR",
             os.path.join(self.project_dir, "mask2former"))
+
+        # ── RL correction model (policy + value network) ───────────────────────
+        # This is the AlphaZero-style MCTS correction agent — NOT a chromosome
+        # classifier.  It takes as input the state produced by Mask2Former
+        # (visual embeddings + current class-assignment one-hot vectors) and
+        # outputs a correction policy and value estimate used by MCTS.
+        # Saved as the "best accepted" version after each evaluation round.
+        self.karyotype_model_dir = os.path.join(self.karyotype_data_dir, "model")
+        self.karyotype_model_config_path = os.path.join(
+            self.karyotype_model_dir, "karyotype_model_config.json")
+        self.karyotype_model_weight_path = os.path.join(
+            self.karyotype_model_dir, "karyotype_model_weight.h5")
+
+        # Next-generation candidates produced by karyotype_optimize.py.
+        self.karyotype_next_gen_dir = os.path.join(
+            self.karyotype_model_dir, "next_generation")
+
+        # Self-play data written by karyotype_self_play.py.
+        self.karyotype_play_data_dir = os.path.join(
+            self.karyotype_data_dir, "play_data")
+        self.karyotype_play_data_filename_tmpl = "karyotype_play_%s.json"
 
         # Torch device for Mask2Former inference.
         # Prefer GPU when available; fall back to CPU automatically.
