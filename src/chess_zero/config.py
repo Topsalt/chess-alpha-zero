@@ -110,7 +110,16 @@ class ResourceConfig:
             os.path.join(self.project_dir, "mask2former"))
 
         # Torch device for Mask2Former inference.
-        self.device = os.environ.get("DEVICE", "cpu")
+        # Prefer GPU when available; fall back to CPU automatically.
+        # Override by setting the DEVICE environment variable (e.g. DEVICE=cpu).
+        if "DEVICE" in os.environ:
+            self.device = os.environ["DEVICE"]
+        else:
+            try:
+                import torch
+                self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                self.device = "cpu"
 
     def create_directories(self):
         dirs = [self.project_dir, self.data_dir, self.model_dir, self.play_data_dir, self.log_dir,
